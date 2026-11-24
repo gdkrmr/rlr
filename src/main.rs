@@ -283,22 +283,41 @@ struct Tick {
 }
 
 /// Compute the ticks of a ruler with an axis of `axis_len` pixels.
-fn ruler_ticks(unit: Unit, axis_len: f64, px_per_mm: f64, scale_factor: i32) -> Vec<Tick> {
+///
+/// Labelled (major) ticks are spaced at least `min_label_px` pixels apart (and
+/// at least 30 pixels), so that labels of that size do not collide.
+fn ruler_ticks(
+    unit: Unit,
+    axis_len: f64,
+    px_per_mm: f64,
+    scale_factor: i32,
+    min_label_px: f64,
+) -> Vec<Tick> {
     let unit_px = unit.unit_px(axis_len, px_per_mm);
     if !(unit_px.is_finite() && unit_px > 0.) || axis_len <= 0. {
         return vec![];
     }
+    let min_label_px = min_label_px.max(30.);
     // (minor step, medium step, major/labelled step) in units.
-    let (minor, medium, major) = if unit == Unit::Pixels {
-        (2_u32, 10_u32, 50_u32)
+    let candidates: &[(u32, u32, u32)] = if unit == Unit::Pixels {
+        &[
+            (2, 10, 50),
+            (2, 10, 100),
+            (2, 10, 200),
+            (2, 10, 250),
+            (2, 10, 500),
+            (10, 50, 1000),
+        ]
     } else {
-        [(1, 5, 10), (2, 10, 20), (5, 25, 50), (10, 50, 100)]
-            .into_iter()
-            .find(|&(minor, _, major)| {
-                f64::from(minor) * unit_px >= 3. && f64::from(major) * unit_px >= 30.
-            })
-            .unwrap_or((10, 50, 100))
+        &[(1, 5, 10), (2, 10, 20), (5, 25, 50), (10, 50, 100)]
     };
+    let (minor, medium, major) = candidates
+        .iter()
+        .copied()
+        .find(|&(minor, _, major)| {
+            f64::from(minor) * unit_px >= 2. && f64::from(major) * unit_px >= min_label_px
+        })
+        .unwrap_or(candidates[candidates.len() - 1]);
     let mut ticks = vec![];
     let mut k: u32 = 0;
     loop {
@@ -750,7 +769,13 @@ impl Rlr {
         cr.set_source_rgba(0.1, 0.1, 0.1, 0.1);
 
         // Make concentric circles at the major ticks of the current distance unit
-        for tick in ruler_ticks(self.unit, length / 2., self.px_per_mm, self.scale_factor) {
+        for tick in ruler_ticks(
+            self.unit,
+            length / 2.,
+            self.px_per_mm,
+            self.scale_factor,
+            0.,
+        ) {
             let r = tick.pos;
             if tick.kind != TickKind::Major || r <= 0. || 2. * r >= length - 1. {
                 continue;
@@ -896,7 +921,9 @@ impl Rlr {
         cr.paint().expect("Invalid cairo surface state");
 
         let _pixels_per_tick = 10;
-        let tick_size = 5.;
+        // Medium tick length; major ticks are 1.5x, minor ticks 0.5x. Capped so that
+        // major ticks from both edges leave the middle of the ruler free for labels.
+        let tick_size = 7_f64.min(breadth / 5.);
         cr.set_line_width(0.5);
         cr.select_font_face(
             self.settings.font_name(),
@@ -954,7 +981,30 @@ impl Rlr {
         let is_reversed = self.rotate.is_reversed();
         let is_rotated = self.rotate.is_rotated();
         let axis_len = if is_rotated { height } else { length };
-        let ticks = ruler_ticks(self.unit, axis_len, self.px_per_mm, self.scale_factor);
+        // Space labels by the size of the widest one: its width along a horizontal
+        // ruler, its height along a vertical one.
+        let widest_label = match self.unit {
+            Unit::Pixels => format!("{:.0}", axis_len * f64::from(self.scale_factor)),
+            Unit::Millimetres => format!("{:.0}", axis_len / self.px_per_mm),
+            Unit::Percent => "100".to_string(),
+        };
+        let widest = cr
+            .text_extents(&widest_label)
+            .expect("Invalid cairo surface state");
+        let label_extent = if is_rotated {
+            widest.height()
+        } else {
+            widest.width()
+        };
+        let ticks = ruler_ticks(
+            self.unit,
+            axis_len,
+            self.px_per_mm,
+            self.scale_factor,
+            label_extent * 1.5 + 6.,
+        );
+        // (text, start and end along the axis, x, y) of the labels to draw.
+        let mut labels: Vec<(&str, f64, f64, f64, f64)> = vec![];
         for tick in &ticks {
             // Keep ticks on the far edge (e.g. 100%) inside the window.
             let mut x = tick.pos.floor().min(axis_len - 1.).max(0.) + 0.5;
@@ -982,17 +1032,35 @@ impl Rlr {
             cr.stroke().expect("Invalid cairo surface state");
             if let Some(label) = tick.label.as_deref() {
                 let extents = cr.text_extents(label).expect("Invalid cairo surface state");
-                if is_rotated {
+                let candidate = if is_rotated {
                     let y = x.clamp(extents.height() + 1., (axis_len - 1.).max(1.));
-                    cr.move_to(breadth / 2. - 2.5 - extents.width() / 2., y);
+                    (
+                        label,
+                        y - extents.height(),
+                        y,
+                        breadth / 2. - 2.5 - extents.width() / 2.,
+                        y,
+                    )
                 } else {
                     let lx = (x - extents.width() / 2.)
                         .min(axis_len - extents.width() - 1.)
                         .max(1.);
-                    cr.move_to(lx, breadth / 2. + 2.5);
+                    (label, lx, lx + extents.width(), lx, breadth / 2. + 2.5)
+                };
+                // Labels clamped at the far edge may still collide with their
+                // neighbour; then drop the neighbour, so the end value stays visible.
+                let gap = 4.;
+                if let Some(prev) = labels.last() {
+                    if candidate.1 < prev.2 + gap && prev.1 < candidate.2 + gap {
+                        labels.pop();
+                    }
                 }
-                cr.show_text(label).expect("Invalid cairo surface state");
+                labels.push(candidate);
             }
+        }
+        for (label, _, _, lx, ly) in labels {
+            cr.move_to(lx, ly);
+            cr.show_text(label).expect("Invalid cairo surface state");
         }
         let (pos, pos_label) = ruler_readout(
             self.unit,
@@ -2205,19 +2273,19 @@ mod tests {
 
     #[test]
     fn pixel_ticks_match_previous_layout() {
-        let ticks = ruler_ticks(Unit::Pixels, 500., 96. / 25.4, 1);
+        let ticks = ruler_ticks(Unit::Pixels, 500., 96. / 25.4, 1, 0.);
         assert_eq!(ticks.len(), 251);
         assert_eq!(ticks[0].label.as_deref(), Some("0"));
         assert_eq!(ticks[5].kind, TickKind::Medium);
         assert_eq!(ticks[25].label.as_deref(), Some("50"));
-        let ticks = ruler_ticks(Unit::Pixels, 100., 1., 2);
+        let ticks = ruler_ticks(Unit::Pixels, 100., 1., 2, 0.);
         assert_eq!(ticks[25].label.as_deref(), Some("100"));
     }
 
     #[test]
     fn percent_ticks_span_full_length() {
         for len in [123., 500., 777., 2000.] {
-            let ticks = ruler_ticks(Unit::Percent, len, 1., 1);
+            let ticks = ruler_ticks(Unit::Percent, len, 1., 1, 0.);
             let last = ticks.last().unwrap();
             assert!((last.pos - len).abs() < 1e-6, "len {len}");
             assert_eq!(last.label.as_deref(), Some("100"));
@@ -2225,9 +2293,24 @@ mod tests {
     }
 
     #[test]
+    fn labels_spread_out_for_large_text() {
+        let labelled = |min_label_px| {
+            ruler_ticks(Unit::Pixels, 500., 1., 1, min_label_px)
+                .into_iter()
+                .filter_map(|t| t.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labelled(0.).len(), 11);
+        assert_eq!(labelled(60.), ["0", "100", "200", "300", "400", "500"]);
+        assert_eq!(labelled(150.), ["0", "200", "400"]);
+        // Fine ticks stay in place.
+        assert_eq!(ruler_ticks(Unit::Pixels, 500., 1., 1, 150.).len(), 251);
+    }
+
+    #[test]
     fn millimetre_ticks() {
         let ppm = 96. / 25.4;
-        let ticks = ruler_ticks(Unit::Millimetres, 500., ppm, 1);
+        let ticks = ruler_ticks(Unit::Millimetres, 500., ppm, 1, 0.);
         assert_eq!(ticks[10].label.as_deref(), Some("10"));
         assert!((ticks[10].pos - 10. * ppm).abs() < 1e-9);
         assert!(ticks.last().unwrap().pos <= 500.);
