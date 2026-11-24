@@ -183,6 +183,187 @@ impl Interval {
     }
 }
 
+/// Unit used for the ruler's ticks, labels and position readout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    /// Screen pixels.
+    Pixels,
+    /// Physical millimetres, derived from the monitor's reported size.
+    Millimetres,
+    /// Percentage of the ruler's length (the full length is 100%).
+    Percent,
+}
+
+impl Unit {
+    const fn next(self) -> Self {
+        match self {
+            Self::Pixels => Self::Millimetres,
+            Self::Millimetres => Self::Percent,
+            Self::Percent => Self::Pixels,
+        }
+    }
+
+    /// Pixels per one unit along an axis of `axis_len` pixels.
+    fn unit_px(self, axis_len: f64, px_per_mm: f64) -> f64 {
+        match self {
+            Self::Pixels => 1.0,
+            Self::Millimetres => px_per_mm,
+            Self::Percent => axis_len / 100.,
+        }
+    }
+}
+
+/// Unit used for the protractor's angle readout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AngleUnit {
+    Degrees,
+    Radians,
+}
+
+impl AngleUnit {
+    const fn next(self) -> Self {
+        match self {
+            Self::Degrees => Self::Radians,
+            Self::Radians => Self::Degrees,
+        }
+    }
+
+    /// Format `angle` (in radians). Without `precision`, degrees snap to whole
+    /// degrees and radians to whole radians.
+    fn format(self, angle: f64, precision: bool) -> String {
+        match self {
+            Self::Radians if precision => format!("{angle:.3}rad"),
+            Self::Radians => format!("{:.0}rad", angle.round()),
+            Self::Degrees if precision => format!("{:.2}°", angle.to_degrees()),
+            Self::Degrees => format!("{:.0}°", angle.to_degrees().round()),
+        }
+    }
+}
+
+/// Format a distance of `dist` pixels from the protractor's center. In percent
+/// mode the radius `radius` is 100%.
+fn format_distance(
+    unit: Unit,
+    dist: f64,
+    radius: f64,
+    px_per_mm: f64,
+    scale_factor: i32,
+    precision: bool,
+) -> String {
+    match unit {
+        Unit::Pixels => format!("{:.0}px", dist.round() * f64::from(scale_factor)),
+        Unit::Millimetres | Unit::Percent => {
+            let (value, suffix) = if unit == Unit::Millimetres {
+                (dist / px_per_mm, "mm")
+            } else {
+                (100. * dist / radius, "%")
+            };
+            if precision {
+                format!("{value:.1}{suffix}")
+            } else {
+                format!("{:.0}{suffix}", value.round())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TickKind {
+    Minor,
+    Medium,
+    Major,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Tick {
+    /// Pixel offset from the ruler's origin side (before flipping).
+    pos: f64,
+    kind: TickKind,
+    label: Option<String>,
+}
+
+/// Compute the ticks of a ruler with an axis of `axis_len` pixels.
+fn ruler_ticks(unit: Unit, axis_len: f64, px_per_mm: f64, scale_factor: i32) -> Vec<Tick> {
+    let unit_px = unit.unit_px(axis_len, px_per_mm);
+    if !(unit_px.is_finite() && unit_px > 0.) || axis_len <= 0. {
+        return vec![];
+    }
+    // (minor step, medium step, major/labelled step) in units.
+    let (minor, medium, major) = if unit == Unit::Pixels {
+        (2_u32, 10_u32, 50_u32)
+    } else {
+        [(1, 5, 10), (2, 10, 20), (5, 25, 50), (10, 50, 100)]
+            .into_iter()
+            .find(|&(minor, _, major)| {
+                f64::from(minor) * unit_px >= 3. && f64::from(major) * unit_px >= 30.
+            })
+            .unwrap_or((10, 50, 100))
+    };
+    let mut ticks = vec![];
+    let mut k: u32 = 0;
+    loop {
+        let value = k * minor;
+        let pos = f64::from(value) * unit_px;
+        // Allow tiny floating point overshoot so that e.g. 100% is included.
+        if pos > axis_len + 1e-6 {
+            break;
+        }
+        let kind = if value % major == 0 {
+            TickKind::Major
+        } else if value % medium == 0 {
+            TickKind::Medium
+        } else {
+            TickKind::Minor
+        };
+        let label = (kind == TickKind::Major).then(|| match unit {
+            Unit::Pixels => format!("{}", i64::from(value) * i64::from(scale_factor)),
+            Unit::Millimetres | Unit::Percent => format!("{value}"),
+        });
+        ticks.push(Tick { pos, kind, label });
+        k += 1;
+    }
+    ticks
+}
+
+/// Compute where to draw the cursor line (pixel offset in window coordinates)
+/// and the readout label for cursor pixel position `pos`.
+fn ruler_readout(
+    unit: Unit,
+    pos: f64,
+    axis_len: f64,
+    px_per_mm: f64,
+    scale_factor: i32,
+    reversed: bool,
+    precision: bool,
+) -> (f64, String) {
+    if unit == Unit::Pixels {
+        let pos = if precision {
+            pos.floor()
+        } else {
+            (pos / 10.).floor() * 10.
+        };
+        return (pos, format!("{}px", pos * f64::from(scale_factor)));
+    }
+    let unit_px = unit.unit_px(axis_len, px_per_mm);
+    // Measure from the side where the zero tick is drawn.
+    let offset = if reversed { axis_len - pos } else { pos };
+    let value = offset / unit_px;
+    let (value, offset) = if precision {
+        (value, offset)
+    } else {
+        let v = value.round();
+        (v, v * unit_px)
+    };
+    let draw_pos = if reversed { axis_len - offset } else { offset };
+    let label = match (unit, precision) {
+        (Unit::Millimetres, true) => format!("{value:.1}mm"),
+        (Unit::Millimetres, false) => format!("{value:.0}mm"),
+        (_, true) => format!("{value:.1}%"),
+        (_, false) => format!("{value:.0}%"),
+    };
+    (draw_pos.floor(), label)
+}
+
 #[derive(Debug)]
 struct Settings {
     obj: Option<gio::Settings>,
@@ -458,6 +639,10 @@ struct Rlr {
     angle_offset: f64,
     interval: Interval,
     ppi: f64,
+    /// Logical (unscaled) pixels per physical millimetre.
+    px_per_mm: f64,
+    unit: Unit,
+    angle_unit: AngleUnit,
     scale_factor: i32,
     settings: Settings,
 }
@@ -485,6 +670,9 @@ impl Default for Rlr {
             angle_offset: 0.,
             interval: Interval::None,
             ppi: 72.,
+            px_per_mm: 96. / 25.4,
+            unit: Unit::Pixels,
+            angle_unit: AngleUnit::Degrees,
             scale_factor: 1,
             settings,
         }
@@ -562,11 +750,11 @@ impl Rlr {
         cr.save().unwrap();
         cr.set_source_rgba(0.1, 0.1, 0.1, 0.1);
 
-        // Make concentric circles at distance `tick_size`
-        for i in 1..(length / 2.).floor() as i64 {
-            let r = (i as f64) * tick_size * 10.;
-            if 2. * r >= length {
-                break;
+        // Make concentric circles at the major ticks of the current distance unit
+        for tick in ruler_ticks(self.unit, length / 2., self.px_per_mm, self.scale_factor) {
+            let r = tick.pos;
+            if tick.kind != TickKind::Major || r <= 0. || 2. * r >= length - 1. {
+                continue;
             }
             cr.arc(length / 2., length / 2., r, 0., 2. * std::f64::consts::PI);
             cr.stroke().expect("Invalid cairo surface state");
@@ -652,11 +840,45 @@ impl Rlr {
         // Show angle measurement as text
         cr.move_to(length / 2. - 5.5, length / 2. - 15.5);
         cr.show_text(&format!(
-            " {:.2}rad {:.2}°",
-            if self.precision { angle } else { angle.round() },
-            if self.precision { angle } else { angle.round() } * (180. / PI)
+            " {}",
+            self.angle_unit.format(angle, self.precision)
         ))
         .expect("Invalid cairo surface state");
+
+        // Show distance of the pointer from the center as text below the center
+        let dist = xr.hypot(yr);
+        let dist_label = format!(
+            " r = {}",
+            format_distance(
+                self.unit,
+                dist,
+                length / 2.,
+                self.px_per_mm,
+                self.scale_factor,
+                self.precision,
+            )
+        );
+        let extents = cr
+            .text_extents(&dist_label)
+            .expect("Invalid cairo surface state");
+        cr.move_to(length / 2. - 5.5, length / 2. + 15.5 + extents.height());
+        cr.show_text(&dist_label)
+            .expect("Invalid cairo surface state");
+
+        // Mark the pointer's distance on the tracking radius with a small circle
+        if dist > 0. && dist < length / 2. {
+            // Start a fresh path: `show_text` left the current point at the end of
+            // the label, and `arc` would otherwise connect it with a line.
+            cr.new_path();
+            cr.arc(
+                length / 2. + xr - 0.5,
+                length / 2. - yr - 0.5,
+                3.,
+                0.,
+                2. * std::f64::consts::PI,
+            );
+            cr.stroke().expect("Invalid cairo surface state");
+        }
 
         glib::Propagation::Proceed
     }
@@ -676,8 +898,6 @@ impl Rlr {
 
         let _pixels_per_tick = 10;
         let tick_size = 5.;
-        let mut i = 0;
-        let mut x: f64;
         cr.set_line_width(0.5);
         cr.select_font_face(
             self.settings.font_name(),
@@ -733,127 +953,108 @@ impl Rlr {
             FontWeight::Normal,
         );
         let is_reversed = self.rotate.is_reversed();
-        if self.rotate.is_rotated() {
-            while i < self.height {
-                x = f64::from(i).floor() + 0.5;
-                if is_reversed {
-                    x = height - x;
-                }
+        let is_rotated = self.rotate.is_rotated();
+        let axis_len = if is_rotated { height } else { length };
+        let ticks = ruler_ticks(self.unit, axis_len, self.px_per_mm, self.scale_factor);
+        for tick in &ticks {
+            // Keep ticks on the far edge (e.g. 100%) inside the window.
+            let mut x = tick.pos.floor().min(axis_len - 1.).max(0.) + 0.5;
+            if is_reversed {
+                x = axis_len - x;
+            }
+            let tick_size = match tick.kind {
+                TickKind::Major => tick_size * 1.5,
+                TickKind::Medium => tick_size,
+                TickKind::Minor => tick_size * 0.5,
+            };
+            if is_rotated {
                 cr.move_to(1.0, x);
-                let tick_size = if i % 50 == 0 {
-                    tick_size * 1.5
-                } else if i % 10 == 0 {
-                    tick_size
-                } else {
-                    tick_size * 0.5
-                };
                 cr.line_to(tick_size, x);
                 cr.stroke().expect("Invalid cairo surface state");
                 cr.move_to(breadth - tick_size, x);
                 cr.line_to(breadth - 1.0, x);
-                cr.stroke().expect("Invalid cairo surface state");
-                if i % 50 == 0 {
-                    // cr.select_font_face("Monospace", FontSlant::Normal, FontWeight::Normal);
-                    let label = format!("{}", i * self.scale_factor);
-                    let extents = cr
-                        .text_extents(&label)
-                        .expect("Invalid cairo surface state");
-                    cr.move_to(breadth / 2. - 2.5 - extents.width() as f64 / 2., x);
-                    cr.show_text(&label).expect("Invalid cairo surface state");
-                }
-                i += 2;
-            }
-            let pos = if self.precision {
-                position.1.floor()
             } else {
-                (position.1 / 10.).floor() * 10.
-            };
+                cr.move_to(x, 1.0);
+                cr.line_to(x, tick_size);
+                cr.stroke().expect("Invalid cairo surface state");
+                cr.move_to(x, breadth - tick_size);
+                cr.line_to(x, breadth - 1.0);
+            }
+            cr.stroke().expect("Invalid cairo surface state");
+            if let Some(label) = tick.label.as_deref() {
+                let extents = cr.text_extents(label).expect("Invalid cairo surface state");
+                if is_rotated {
+                    let y = x.clamp(extents.height() + 1., (axis_len - 1.).max(1.));
+                    cr.move_to(breadth / 2. - 2.5 - extents.width() / 2., y);
+                } else {
+                    let lx = (x - extents.width() / 2.)
+                        .min(axis_len - extents.width() - 1.)
+                        .max(1.);
+                    cr.move_to(lx, breadth / 2. + 2.5);
+                }
+                cr.show_text(label).expect("Invalid cairo surface state");
+            }
+        }
+        let (pos, pos_label) = ruler_readout(
+            self.unit,
+            if is_rotated { position.1 } else { position.0 },
+            axis_len,
+            self.px_per_mm,
+            self.scale_factor,
+            is_reversed,
+            self.precision,
+        );
+        if is_rotated {
             let x = pos + 0.5;
             cr.move_to(1.0, x);
             cr.line_to(breadth, x);
             cr.stroke().expect("Invalid cairo surface state");
-            let pos_label = format!("{}px", pos * f64::from(self.scale_factor));
             let extents = cr
                 .text_extents(&pos_label)
                 .expect("Invalid cairo surface state");
             cr.rectangle(
-                breadth / 2. - extents.width() as f64 / 2. - 2.,
-                x - extents.height() as f64 - 2.,
-                extents.width() as f64 + 6.5,
-                extents.height() as f64 + 6.5,
+                breadth / 2. - extents.width() / 2. - 2.,
+                x - extents.height() - 2.,
+                extents.width() + 6.5,
+                extents.height() + 6.5,
             );
             cr.stroke().expect("Invalid cairo surface state");
             cr.rectangle(
-                breadth / 2. - extents.width() as f64 / 2.,
-                x - extents.height() as f64,
-                extents.width() as f64 + 4.5,
-                extents.height() as f64 + 4.5,
+                breadth / 2. - extents.width() / 2.,
+                x - extents.height(),
+                extents.width() + 4.5,
+                extents.height() + 4.5,
             );
             cr.set_secondary_color(&self.settings);
             cr.fill().expect("Invalid cairo surface state");
             cr.set_primary_color(&self.settings);
 
-            cr.move_to(breadth / 2. - extents.width() as f64 / 2., x);
+            cr.move_to(breadth / 2. - extents.width() / 2., x);
             cr.show_text(&pos_label)
                 .expect("Invalid cairo surface state");
 
             cr.rectangle(0.5, 0.5, length - 1.0, height - 1.0);
         } else {
-            while i < self.width {
-                x = f64::from(i).floor() + 0.5;
-                if is_reversed {
-                    x = length - x;
-                }
-                cr.move_to(x, 1.0);
-                let tick_size = if i % 50 == 0 {
-                    tick_size * 1.5
-                } else if i % 10 == 0 {
-                    tick_size
-                } else {
-                    tick_size * 0.5
-                };
-                cr.line_to(x, tick_size);
-                cr.stroke().expect("Invalid cairo surface state");
-                cr.move_to(x, breadth - tick_size);
-                cr.line_to(x, breadth - 1.0);
-                cr.stroke().expect("Invalid cairo surface state");
-                if i % 50 == 0 {
-                    // cr.select_font_face("Monospace", FontSlant::Normal, FontWeight::Normal);
-                    let label = format!("{}", i * self.scale_factor);
-                    let extents = cr
-                        .text_extents(&label)
-                        .expect("Invalid cairo surface state");
-                    cr.move_to(x - extents.width() as f64 / 2., breadth / 2. + 2.5);
-                    cr.show_text(&label).expect("Invalid cairo surface state");
-                }
-                i += 2;
-            }
-            let pos = if self.precision {
-                position.0.floor()
-            } else {
-                (position.0 / 10.).floor() * 10.
-            };
             let x = pos + 0.5 + 2.0;
             cr.move_to(x - 2., 1.0);
             cr.line_to(x - 2., breadth);
             cr.stroke().expect("Invalid cairo surface state");
 
-            let pos_label = format!("{}px", pos * f64::from(self.scale_factor));
             let extents = cr
                 .text_extents(&pos_label)
                 .expect("Invalid cairo surface state");
             cr.rectangle(
                 x - 2.,
-                breadth / 2. - extents.height() as f64 - 2.,
-                extents.width() as f64 + 6.5,
-                extents.height() as f64 + 10.5,
+                breadth / 2. - extents.height() - 2.,
+                extents.width() + 6.5,
+                extents.height() + 10.5,
             );
             cr.stroke().expect("Invalid cairo surface state");
             cr.rectangle(
                 x,
-                breadth / 2. - extents.height() as f64,
-                extents.width() as f64 + 4.5,
-                extents.height() as f64 + 8.5,
+                breadth / 2. - extents.height(),
+                extents.width() + 4.5,
+                extents.height() + 8.5,
             );
             cr.set_secondary_color(&self.settings);
             cr.fill().expect("Invalid cairo surface state");
@@ -954,6 +1155,7 @@ fn run_app() -> Option<i32> {
         application.set_accels_for_action("app.rotate", &["R"]);
         application.set_accels_for_action("app.flip", &["<Shift>R"]);
         application.set_accels_for_action("app.protractor", &["P"]);
+        application.set_accels_for_action("app.unit", &["U"]);
         application.set_accels_for_action("app.freeze", &["F", "space"]);
         application.set_accels_for_action("app.increase", &["plus"]);
         application.set_accels_for_action("app.decrease", &["minus"]);
@@ -1209,8 +1411,15 @@ where
 
     window.show_all();
     let (ppi, scale_factor) = get_ppi_and_scale_factor(&window);
+    // The monitor may not report a physical size, in which case `ppi` is not finite.
+    let ppi_valid = ppi.is_finite() && ppi > 0.;
     if let Ok(mut lck) = rlr.lock() {
-        if ppi > 72. {
+        lck.px_per_mm = if ppi_valid {
+            ppi / f64::from(scale_factor.max(1)) / 25.4
+        } else {
+            96. / 25.4
+        };
+        if ppi_valid && ppi > 72. {
             lck.ppi = ppi;
             lck.scale_factor = scale_factor;
             lck.width += (scale_factor * lck.width) / 2;
@@ -1338,6 +1547,19 @@ fn add_actions(
                     }
                     window.move_(x, y);
                 }
+            }
+        }
+        window.queue_draw();
+    }));
+
+    let unit = gio::SimpleAction::new("unit", None);
+    unit.connect_activate(glib::clone!(@strong rlr, @weak window => move |_, _| {
+        {
+            let mut lck = rlr.lock().unwrap();
+            if lck.protractor {
+                lck.angle_unit = lck.angle_unit.next();
+            } else {
+                lck.unit = lck.unit.next();
             }
         }
         window.queue_draw();
@@ -1502,6 +1724,7 @@ fn add_actions(
     application.add_action(&decrease_font_size);
     application.add_action(&freeze);
     application.add_action(&protractor);
+    application.add_action(&unit);
     application.add_action(&rotate);
     application.add_action(&flip);
     application.add_action(&about);
@@ -1847,6 +2070,8 @@ Press {ms}s{me} or {ms}F2{me} to {bs}open the Settings window{be}.
 Press {ms}r{me} to {bs}rotate{be} 90 degrees. Press {ms}{lt}Shift{gt}r{me} to {bs}flip \
              (mirror){be} the marks without rotation.
 Press {ms}p{me} to toggle {bs}protractor mode{be}.
+Press {ms}u{me} to {bs}cycle units{be}: in ruler mode between pixels, millimetres and percent of the ruler \
+             length; in protractor mode between degrees and radians.
 Press {ms}f{me} or {ms}{lt}Space{gt}{me} to toggle {bs}freezing the measurements{be}.
 Press {ms}{primary}{me} and drag the angle base side to {bs}rotate it while in protractor mode{be}.
 Press {ms}{primary}{me} continuously to {bs}disable precision{be} (measurements will snap to \
@@ -1952,6 +2177,7 @@ fn make_context_menu(window: &gtk::ApplicationWindow, accel_group: &gtk::AccelGr
         ("Rotate", "app.rotate"),
         ("Flip", "app.flip"),
         ("Toggle protractor", "app.protractor"),
+        ("Cycle units", "app.unit"),
         ("Toggle freeze", "app.freeze"),
         ("Increase size", "app.increase"),
         ("Decrease size", "app.decrease"),
@@ -1972,4 +2198,90 @@ fn make_context_menu(window: &gtk::ApplicationWindow, accel_group: &gtk::AccelGr
         ("Quit", "app.quit"),
     };
     menu.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixel_ticks_match_previous_layout() {
+        let ticks = ruler_ticks(Unit::Pixels, 500., 96. / 25.4, 1);
+        assert_eq!(ticks.len(), 251);
+        assert_eq!(ticks[0].label.as_deref(), Some("0"));
+        assert_eq!(ticks[5].kind, TickKind::Medium);
+        assert_eq!(ticks[25].label.as_deref(), Some("50"));
+        let ticks = ruler_ticks(Unit::Pixels, 100., 1., 2);
+        assert_eq!(ticks[25].label.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn percent_ticks_span_full_length() {
+        for len in [123., 500., 777., 2000.] {
+            let ticks = ruler_ticks(Unit::Percent, len, 1., 1);
+            let last = ticks.last().unwrap();
+            assert!((last.pos - len).abs() < 1e-6, "len {len}");
+            assert_eq!(last.label.as_deref(), Some("100"));
+        }
+    }
+
+    #[test]
+    fn millimetre_ticks() {
+        let ppm = 96. / 25.4;
+        let ticks = ruler_ticks(Unit::Millimetres, 500., ppm, 1);
+        assert_eq!(ticks[10].label.as_deref(), Some("10"));
+        assert!((ticks[10].pos - 10. * ppm).abs() < 1e-9);
+        assert!(ticks.last().unwrap().pos <= 500.);
+    }
+
+    #[test]
+    fn angle_formats() {
+        let a = std::f64::consts::FRAC_PI_4;
+        assert_eq!(AngleUnit::Degrees.format(a, true), "45.00°");
+        assert_eq!(AngleUnit::Degrees.format(0.7, false), "40°");
+        assert_eq!(AngleUnit::Radians.format(a, true), "0.785rad");
+    }
+
+    #[test]
+    fn distance_formats() {
+        assert_eq!(
+            format_distance(Unit::Pixels, 50.4, 200., 4., 2, true),
+            "100px"
+        );
+        assert_eq!(
+            format_distance(Unit::Millimetres, 40., 200., 4., 1, true),
+            "10.0mm"
+        );
+        assert_eq!(
+            format_distance(Unit::Percent, 50., 200., 4., 1, true),
+            "25.0%"
+        );
+        assert_eq!(
+            format_distance(Unit::Percent, 51., 200., 4., 1, false),
+            "26%"
+        );
+    }
+
+    #[test]
+    fn readouts() {
+        assert_eq!(
+            ruler_readout(Unit::Percent, 250., 500., 1., 1, false, true).1,
+            "50.0%"
+        );
+        // Flipped: the zero tick is on the far side.
+        assert_eq!(
+            ruler_readout(Unit::Percent, 100., 500., 1., 1, true, true).1,
+            "80.0%"
+        );
+        assert_eq!(
+            ruler_readout(Unit::Millimetres, 40., 500., 4., 1, false, true).1,
+            "10.0mm"
+        );
+        let (pos, label) = ruler_readout(Unit::Percent, 252., 500., 1., 1, false, false);
+        assert_eq!((pos, label.as_str()), (250., "50%"));
+        assert_eq!(
+            ruler_readout(Unit::Pixels, 123.7, 500., 1., 2, false, true).1,
+            "246px"
+        );
+    }
 }

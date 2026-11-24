@@ -62,6 +62,7 @@ If you are on macOS, use <kbd>⌘</kbd> (Command) key instead of <kbd>Ctrl</kbd>
 - Press <kbd>s</kbd> or <kbd>F2</kbd> to **open the Settings window**.
 - Press <kbd>r</kbd> to **rotate** 90 degrees. Press <kbd>Shift</kbd> + <kbd>r</kbd> to **flip (mirror)** the marks without rotation.
 - Press <kbd>p</kbd> to toggle **protractor mode**.
+- Press <kbd>u</kbd> to **cycle units**. In ruler mode it cycles the distance unit between pixels, millimetres (physical length, from the monitor's reported size) and percent (the ruler's length is 100%). In protractor mode it toggles the angle unit between degrees and radians. The protractor also shows the pointer's distance from the center in the current distance unit (in percent mode, the radius is 100%).
 - Press <kbd>f</kbd> or <kbd>Space</kbd> to toggle **freezing the measurements**.
 - Press <kbd>Ctrl</kbd> and drag the angle base side to **rotate it while in protractor mode**.
 - Press <kbd>Ctrl</kbd> continuously to **disable precision** (measurements will snap to nearest integer).
