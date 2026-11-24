@@ -425,9 +425,8 @@ impl Settings {
             }
             if !missing_keys.is_empty() {
                 return Err(format!(
-                    "GSettings schema does not contain valid keys; found keys {:?} but the \
-                     following keys are missing: {:?}.",
-                    keys, missing_keys
+                    "GSettings schema does not contain valid keys; found keys {keys:?} but the \
+                     following keys are missing: {missing_keys:?}."
                 )
                 .into());
             }
@@ -440,8 +439,8 @@ impl Settings {
                 let value_type = gsettings_schema.key(required_key).value_type();
                 if value_type.as_ref() != *data_type {
                     invalid_key_types.push(format!(
-                        "Expected {} for key {} but found {} instead.",
-                        data_type, required_key, value_type
+                        "Expected {data_type} for key {required_key} but found {value_type} \
+                         instead."
                     ));
                 }
                 if !invalid_key_types.is_empty() {
@@ -717,7 +716,7 @@ impl Rlr {
         let root_position = self.root_position;
         let root_position = (
             f64::from(root_position.0) - length / 2.,
-            -1. * (f64::from(root_position.1) - length / 2.),
+            -(f64::from(root_position.1) - length / 2.),
         );
         let (xr, yr) = root_position;
         let angle = self.calc_angle_of_point((xr, yr));
@@ -1208,7 +1207,7 @@ where
         .events(gdk::EventMask::POINTER_MOTION_MASK)
         .build();
     window.set_icon(Some(
-        &gtk::gdk_pixbuf::Pixbuf::from_resource(&format!("/images/{}.svg", APP_ID)).unwrap(),
+        &gtk::gdk_pixbuf::Pixbuf::from_resource(&format!("/images/{APP_ID}.svg")).unwrap(),
     ));
 
     set_visual(&window, None);
@@ -2098,7 +2097,7 @@ Press {ms}Up{me}, {ms}Down{me}, {ms}Left{me}, {ms}Right{me} to {bs}move window p
     let p = AboutDialog::new();
     p.set_program_name("rlr");
     p.set_logo(Some(
-        &gtk::gdk_pixbuf::Pixbuf::from_resource(&format!("/images/{}.svg", APP_ID)).unwrap(),
+        &gtk::gdk_pixbuf::Pixbuf::from_resource(&format!("/images/{APP_ID}.svg")).unwrap(),
     ));
     p.set_website_label(Some("https://github.com/epilys/rlr"));
     p.set_website(Some("https://github.com/epilys/rlr"));
